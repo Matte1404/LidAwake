@@ -2,6 +2,18 @@ import Cocoa
 import IOKit.ps
 import CoreGraphics
 
+// Localization: the app ships no .lproj resources, so match the user's full
+// preferred-language list against what we support (en, ru) the same way
+// NSLocalizedString would — e.g. ["uk", "ru", "en"] still resolves to Russian, and
+// "rue" doesn't false-match a naive prefix check. The `forPreferences:` argument is
+// load-bearing: the single-argument overload filters against Bundle.main.localizations,
+// which is empty without .lproj, so it would return "en" for everyone (Russian
+// included). Computed per call so a live language change is picked up without restart.
+var isRU: Bool {
+    Bundle.preferredLocalizations(from: ["en", "ru"], forPreferences: Locale.preferredLanguages).first == "ru"
+}
+func L(_ en: String, _ ru: String) -> String { isRU ? ru : en }
+
 // LidAwake keeps a per-power-source policy: independently decide whether the Mac
 // stays awake on lid close while on AC vs. on battery. `disablesleep` is a single
 // GLOBAL live value (not stored per-source and not auto-switched by macOS), so this
@@ -129,11 +141,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func promptSetup() {
         let alert = NSAlert()
-        alert.messageText = "Let LidAwake manage sleep automatically?"
-        alert.informativeText = "LidAwake can switch lid-close sleep for AC and battery on its own. "
-            + "This needs a one-time admin approval so it never asks for your password again."
-        alert.addButton(withTitle: "Enable")
-        alert.addButton(withTitle: "Not Now")
+        alert.messageText = L("Let LidAwake manage sleep automatically?",
+                              "Разрешить LidAwake управлять сном автоматически?")
+        alert.informativeText = L(
+            "LidAwake can switch lid-close sleep for AC and battery on its own. "
+                + "This needs a one-time admin approval so it never asks for your password again.",
+            "LidAwake может сам переключать режим сна при закрытии крышки для питания от сети и от "
+                + "батареи. Для этого нужно однократное подтверждение администратора, чтобы пароль "
+                + "больше никогда не запрашивался.")
+        alert.addButton(withTitle: L("Enable", "Включить"))
+        alert.addButton(withTitle: L("Not Now", "Не сейчас"))
         if alert.runModal() == .alertFirstButtonReturn { installSudoersRule() }
     }
 
@@ -177,8 +194,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             if msg.contains("-128") || msg.contains("User canceled") { return false } // user hit Cancel
             let alert = NSAlert()
-            alert.messageText = "LidAwake couldn't change the setting"
-            alert.informativeText = msg.isEmpty ? "Unknown error" : msg
+            alert.messageText = L("LidAwake couldn't change the setting",
+                                 "Не удалось изменить настройку")
+            alert.informativeText = msg.isEmpty ? L("Unknown error", "Неизвестная ошибка") : msg
             alert.runModal()
             return false
         }
@@ -196,8 +214,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Coffee cup when staying awake, sleeping moon otherwise.
     func updateIcon() {
         let symbol = awake ? "cup.and.saucer.fill" : "moon.zzz"
+        let desc = awake ? L("Staying awake", "Не засыпает")
+                         : L("Sleeps on lid close", "Засыпает при закрытии крышки")
         guard let button = statusItem.button else { return }
-        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol) {
+        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: desc) {
             img.isTemplate = true // recolors itself for light/dark menu bar
             button.image = img
             button.title = ""
@@ -211,27 +231,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = statusItem.menu!
         menu.removeAllItems()
         let onAC = onACPower()
-        let status = NSMenuItem(
-            title: "On \(onAC ? "AC power" : "battery") · " + (awake ? "staying awake" : "sleeps on lid close"),
-            action: nil, keyEquivalent: "")
+        let src = onAC ? L("On AC power", "От сети") : L("On battery", "От батареи")
+        let state = awake ? L("staying awake", "не засыпает")
+                          : L("sleeps on lid close", "засыпает при закрытии крышки")
+        let status = NSMenuItem(title: "\(src) · \(state)", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
         menu.addItem(.separator())
-        let ac = NSMenuItem(title: "Stay Awake on AC Power", action: #selector(toggleAC), keyEquivalent: "")
+        let ac = NSMenuItem(title: L("Stay Awake on AC Power", "Не засыпать при питании от сети"), action: #selector(toggleAC), keyEquivalent: "")
         ac.state = awakeOnAC ? .on : .off
         menu.addItem(ac)
-        let bat = NSMenuItem(title: "Stay Awake on Battery", action: #selector(toggleBattery), keyEquivalent: "")
+        let bat = NSMenuItem(title: L("Stay Awake on Battery", "Не засыпать при питании от батареи"), action: #selector(toggleBattery), keyEquivalent: "")
         bat.state = awakeOnBattery ? .on : .off
         menu.addItem(bat)
-        let ext = NSMenuItem(title: "Turn Off External Display on Lid Close", action: #selector(toggleExternal), keyEquivalent: "")
+        let ext = NSMenuItem(title: L("Turn Off External Display on Lid Close", "Выключать внешний дисплей при закрытии крышки"), action: #selector(toggleExternal), keyEquivalent: "")
         ext.state = offExternalOnLidClose ? .on : .off
         menu.addItem(ext)
         menu.addItem(.separator())
-        let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
+        let login = NSMenuItem(title: L("Launch at Login", "Запускать при входе"), action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: L("Quit", "Выйти"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
     func menuWillOpen(_ menu: NSMenu) {
