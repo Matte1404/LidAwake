@@ -1,290 +1,387 @@
 import Cocoa
 import IOKit.ps
 import CoreGraphics
+import LidAwakeCore
 
-// Localization: the app ships no .lproj resources, so match the user's full
-// preferred-language list against what we support (en, ru) the same way
-// NSLocalizedString would — e.g. ["uk", "ru", "en"] still resolves to Russian, and
-// "rue" doesn't false-match a naive prefix check. The `forPreferences:` argument is
-// load-bearing: the single-argument overload filters against Bundle.main.localizations,
-// which is empty without .lproj, so it would return "en" for everyone (Russian
-// included). Computed per call so a live language change is picked up without restart.
-var isRU: Bool {
-    Bundle.preferredLocalizations(from: ["en", "ru"], forPreferences: Locale.preferredLanguages).first == "ru"
+private func L(_ en: String, _ ru: String) -> String {
+    Bundle.preferredLocalizations(from: ["en", "ru"], forPreferences: Locale.preferredLanguages).first == "ru" ? ru : en
 }
-func L(_ en: String, _ ru: String) -> String { isRU ? ru : en }
 
-// LidAwake keeps a per-power-source policy: independently decide whether the Mac
-// stays awake on lid close while on AC vs. on battery. `disablesleep` is a single
-// GLOBAL live value (not stored per-source and not auto-switched by macOS), so this
-// app detects the power source and writes the right value itself on every change.
-class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let sudoersPath = "/etc/sudoers.d/lidawake"
-    var powerSource: CFRunLoopSource?
-    var awake = false        // cached live SleepDisabled, for the icon
-    var loginEnabled = false // cached "in Login Items?", refreshed when menu opens
+private func onACPower() -> Bool {
+    let blob = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+    return IOPSGetProvidingPowerSourceType(blob).takeUnretainedValue() as String == kIOPSACPowerValue
+}
 
-    // Per-source policy (default: sleep normally on both).
-    var awakeOnAC: Bool {
-        get { UserDefaults.standard.bool(forKey: "awakeOnAC") }
-        set { UserDefaults.standard.set(newValue, forKey: "awakeOnAC") }
+private struct MenuState {
+    var policy = SleepPolicy()
+    var awake: Bool?
+    var onAC = true
+    var setupReady = false
+    var loginEnabled: Bool?
+    var error: String?
+    var loginError: String?
+}
+
+/// All blocking work and mutable power policy live on AppDelegate.workQueue.
+private final class AppRuntime {
+    let runner = ProcessCommandRunner()
+    let sleep = SleepWorkerClient(executable: Bundle.main.executableURL!)
+    lazy var setup = PrivilegeSetup(runner: runner)
+    lazy var login = LoginItems(runner: runner, bundleURL: Bundle.main.bundleURL)
+    lazy var controller = PolicyController(
+        policy: SleepPolicy(isEnabled: UserDefaults.standard.bool(forKey: "lidAwakeEnabled"),
+                            onAC: UserDefaults.standard.bool(forKey: "awakeOnAC"),
+                            onBattery: UserDefaults.standard.bool(forKey: "awakeOnBattery")),
+        sleep: sleep, onACPower: onACPower,
+        persist: { policy in
+            UserDefaults.standard.set(policy.isEnabled, forKey: "lidAwakeEnabled")
+            UserDefaults.standard.set(policy.onAC, forKey: "awakeOnAC")
+            UserDefaults.standard.set(policy.onBattery, forKey: "awakeOnBattery")
+        })
+    var loginEnabled: Bool?
+    var loginError: String?
+
+    func refreshLogin() {
+        do { loginEnabled = try login.isEnabled(); loginError = nil }
+        catch { loginEnabled = nil; loginError = error.localizedDescription }
     }
-    var awakeOnBattery: Bool {
-        get { UserDefaults.standard.bool(forKey: "awakeOnBattery") }
-        set { UserDefaults.standard.set(newValue, forKey: "awakeOnBattery") }
+
+    func snapshot(error: Error? = nil) -> MenuState {
+        var result = MenuState(policy: controller.policy, onAC: onACPower(), setupReady: setup.isInstalled,
+                               loginEnabled: loginEnabled, error: error?.localizedDescription, loginError: loginError)
+        do { result.awake = try sleep.isAwake() }
+        catch { result.awake = nil; result.error = result.error ?? error.localizedDescription }
+        return result
     }
-    // When staying awake with the lid closed, also turn off an attached external
-    // display (fully headless) instead of leaving it on for clamshell. Defaults to on.
-    var offExternalOnLidClose: Bool {
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let workQueue = DispatchQueue(label: "local.lidawake.control", qos: .utility)
+    private let runtime = AppRuntime()
+    private var state = MenuState()
+    private var busy = false
+    private var pendingOperations = 0
+    private var pendingUserOperations = 0
+    private var menuRenderer: StableMenu?
+    private var displayedSymbol: String?
+    private var displayedIconDescription: String?
+    private var refreshPending = false
+    private var terminating = false
+    private var checkingUpdates = false
+    private var powerSource: CFRunLoopSource?
+    private var timer: Timer?
+    private var offExternal: Bool {
         get { UserDefaults.standard.bool(forKey: "offExternalOnLidClose") }
         set { UserDefaults.standard.set(newValue, forKey: "offExternalOnLidClose") }
     }
+    private var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0" }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        UserDefaults.standard.register(defaults: ["offExternalOnLidClose": true])
-        NSApp.setActivationPolicy(.accessory) // menu-bar only, no Dock icon
+        // Existing installations keep applying their saved AC/battery choices.
+        UserDefaults.standard.register(defaults: ["offExternalOnLidClose": true, "lidAwakeEnabled": true])
+        NSApp.setActivationPolicy(.accessory)
         let menu = NSMenu()
         menu.delegate = self
+        menu.autoenablesItems = false
         statusItem.menu = menu
-        if !hasPasswordlessSetup { promptSetup() } // ask once, right after install
+        menuRenderer = StableMenu(menu: menu)
+        updateUI()
         startPowerMonitor()
-        applyForCurrentSource(auto: true)
-        // Poll the lid so we can sleep the internal display on lid close (see lidTick).
-        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.lidTick() }
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        perform({ runtime in
+            try runtime.sleep.start()
+            try runtime.controller.reconcile()
+        }, completion: { [weak self] _ in
+            guard let self = self else { return }
+            if !self.state.setupReady && !UserDefaults.standard.bool(forKey: "sleepSetupOfferedV2") {
+                UserDefaults.standard.set(true, forKey: "sleepSetupOfferedV2")
+                self.promptSetup()
+            }
+        })
     }
 
-    // MARK: - Lid → display off
+    // Quit waits for verified restoration. A crash instead closes the worker's
+    // input pipe, which invokes the same cleanup independently of AppKit.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminating else { return .terminateLater }
+        terminating = true
+        busy = true
+        updateUI()
+        workQueue.async {
+            var failure: Error?
+            do { try self.runtime.controller.stop() } catch { failure = error }
+            DispatchQueue.main.async {
+                if let failure = failure {
+                    let alert = NSAlert()
+                    alert.messageText = L("Sleep could not be restored", "Не удалось восстановить сон")
+                    alert.informativeText = L("The Mac may remain awake. Stay open to repair Sleep Setup and try again.\n\n",
+                                             "Mac может не засыпать. Оставьте приложение открытым, исправьте настройку сна и повторите попытку.\n\n") + failure.localizedDescription
+                    alert.addButton(withTitle: L("Stay Open", "Остаться"))
+                    alert.addButton(withTitle: L("Quit Anyway", "Всё равно выйти"))
+                    let quit = alert.runModal() == .alertSecondButtonReturn
+                    self.terminating = quit
+                    self.busy = quit
+                    sender.reply(toApplicationShouldTerminate: quit)
+                    if !quit { self.updateUI() }
+                } else { sender.reply(toApplicationShouldTerminate: true) }
+            }
+        }
+        return .terminateLater
+    }
 
-    // While staying awake with the lid closed, `disablesleep` keeps displays powered.
-    // So when the lid is shut, put the screen to sleep ourselves — the Mac stays awake,
-    // only the display turns off. The internal panel is always blanked; an external is
-    // blanked too unless the user keeps it on for clamshell (offExternalOnLidClose).
-    func lidTick() {
-        guard lidClosed() else { return }
-        let stayAwake = onACPower() ? awakeOnAC : awakeOnBattery
-        guard stayAwake else { return }
-        if hasExternalDisplay() && !offExternalOnLidClose { return } // clamshell: leave external on
-        if CGDisplayIsAsleep(CGMainDisplayID()) == 0 {               // a display still on → sleep it
-            shell("/usr/bin/pmset", ["displaysleepnow"])             // no root needed
+    private func perform(_ work: @escaping (AppRuntime) throws -> Void,
+                         showFailure: Bool = false, affectsSleep: Bool = true,
+                         completion: ((Error?) -> Void)? = nil) {
+        guard !terminating else { return }
+        // Polls coalesce; an explicit action (including an admin alert response)
+        // must remain queued if a timer fired while the alert was open.
+        guard !busy || showFailure else { refreshPending = true; return }
+        pendingOperations += 1
+        busy = true
+        if showFailure {
+            pendingUserOperations += 1
+            updateUI()
+        }
+        workQueue.async {
+            var failure: Error?
+            do { try work(self.runtime) } catch { failure = error }
+            let snapshot = self.runtime.snapshot(error: affectsSleep ? failure : nil)
+            DispatchQueue.main.async {
+                self.pendingOperations -= 1
+                if showFailure { self.pendingUserOperations -= 1 }
+                guard !self.terminating else { return }
+                self.state = snapshot
+                self.busy = self.pendingOperations > 0
+                self.updateUI()
+                if showFailure, let failure = failure, failure as? ControlError != .canceled {
+                    self.showError(failure.localizedDescription)
+                }
+                completion?(failure)
+                if self.refreshPending && !self.busy {
+                    self.refreshPending = false
+                    self.tick()
+                }
+            }
         }
     }
 
-    // AppleClamshellState on IOPMrootDomain: true == lid closed (verified empirically).
-    func lidClosed() -> Bool {
+    private func startPowerMonitor() {
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let source = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context = context else { return }
+            Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue().tick()
+        }, context)?.takeRetainedValue() else {
+            // The two-second reconciliation timer also detects source changes.
+            return
+        }
+        powerSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+    }
+
+    private func tick() {
+        let blankDisplay = shouldBlankDisplay()
+        perform { runtime in
+            var failure: Error?
+            do { try runtime.controller.reconcile() } catch { failure = error }
+            // Blanking still matters if a failed restore left the machine awake.
+            if runtime.controller.policy.isEnabled && blankDisplay, try runtime.sleep.isAwake() {
+                _ = try runtime.runner.run("/usr/bin/pmset", ["displaysleepnow"], timeout: 10)
+            }
+            if let failure = failure { throw failure }
+        }
+    }
+
+    private func shouldBlankDisplay() -> Bool {
         let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
         guard root != 0 else { return false }
         defer { IOObjectRelease(root) }
-        let p = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)
-        return (p?.takeRetainedValue() as? Bool) ?? false
-    }
-
-    // True if any online display is not the built-in panel (i.e. an external is attached).
-    func hasExternalDisplay() -> Bool {
+        let property = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)
+        guard property?.takeRetainedValue() as? Bool == true else { return false }
         var count: UInt32 = 0
-        CGGetOnlineDisplayList(0, nil, &count)
-        guard count > 0 else { return false }
-        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        CGGetOnlineDisplayList(count, &ids, &count)
-        return ids.contains { CGDisplayIsBuiltin($0) == 0 }
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return false }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return false }
+        let online = displays.prefix(Int(count))
+        if !offExternal && online.contains(where: { CGDisplayIsBuiltin($0) == 0 }) { return false }
+        return online.contains { CGDisplayIsAsleep($0) == 0 }
     }
 
-    // MARK: - Power source
-
-    // True when the Mac is running on the wall charger.
-    func onACPower() -> Bool {
-        let blob = IOPSCopyPowerSourcesInfo().takeRetainedValue()
-        let type = IOPSGetProvidingPowerSourceType(blob).takeUnretainedValue() as String
-        return type == kIOPSACPowerValue
+    private var sleepSymbol: String {
+        state.awake == nil || state.error != nil ? "exclamationmark.triangle"
+            : (state.awake == true ? "cup.and.saucer.fill" : "moon.zzz")
     }
 
-    // Fire applyForCurrentSource() whenever the power source changes (plug/unplug).
-    func startPowerMonitor() {
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        guard let src = IOPSNotificationCreateRunLoopSource({ ctx in
-            Unmanaged<AppDelegate>.fromOpaque(ctx!).takeUnretainedValue().applyForCurrentSource(auto: true)
-        }, ctx)?.takeRetainedValue() else { return }
-        powerSource = src
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .defaultMode)
-    }
-
-    // Bring the live setting in line with the current source's policy, then refresh UI.
-    // `auto` events (launch, plug/unplug) skip the change when not passwordless, so we
-    // never surprise the user with a password dialog they didn't trigger.
-    func applyForCurrentSource(auto: Bool) {
-        let desired = onACPower() ? awakeOnAC : awakeOnBattery
-        if liveAwake() != desired, !(auto && !hasPasswordlessSetup) {
-            setDisableSleep(desired)
+    private func updateUI() {
+        let unavailable = state.awake == nil || state.error != nil
+        let symbol = sleepSymbol
+        let description = state.awake.map { $0 ? L("Staying awake", "Не засыпает") : L("Sleep enabled", "Сон разрешён") }
+            ?? L("Sleep status unavailable", "Состояние сна недоступно")
+        if let button = statusItem.button {
+            if displayedSymbol != symbol || displayedIconDescription != description {
+                let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
+                image?.isTemplate = true
+                button.image = image
+                button.title = image == nil ? (unavailable ? "⚠" : (state.awake == true ? "☕" : "☾")) : ""
+                displayedSymbol = symbol
+                displayedIconDescription = description
+            }
+            let tooltip = state.error ?? description
+            if button.toolTip != tooltip { button.toolTip = tooltip }
         }
-        updateUI()
+        updateMenu()
     }
 
-    // MARK: - pmset
-
-    func liveAwake() -> Bool {
-        // `disablesleep` is a live override shown by `pmset -g` (not `-g custom`).
-        shell("/usr/bin/pmset", ["-g"]).range(of: "SleepDisabled\\s+1", options: .regularExpression) != nil
-    }
-
-    func setDisableSleep(_ disabled: Bool) {
-        let v = disabled ? "1" : "0"
-        if hasPasswordlessSetup {
-            _ = shell("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", v]) // no prompt
-        } else {
-            runAdmin("/usr/bin/pmset -a disablesleep \(v)") // prompts for password
+    private func updateMenu() {
+        var entries = [MenuEntry]()
+        let controlsEnabled = pendingUserOperations == 0 && !terminating
+        let awakeControlsEnabled = controlsEnabled && state.policy.isEnabled
+        func item(_ id: String, _ title: String, _ action: Selector? = nil, key: String = "",
+                  checked: Bool? = false, enabled: Bool = true, indent: Int = 0, symbol: String? = nil) {
+            let checkState: NSControl.StateValue = checked.map { $0 ? .on : .off } ?? .mixed
+            entries.append(MenuEntry(id: id, title: title, action: action, keyEquivalent: key,
+                                     state: checkState, enabled: enabled, indentationLevel: indent, symbol: symbol))
         }
-    }
-
-    // MARK: - One-time privileged setup
-
-    var hasPasswordlessSetup: Bool { FileManager.default.fileExists(atPath: sudoersPath) }
-
-    func promptSetup() {
-        let alert = NSAlert()
-        alert.messageText = L("Let LidAwake manage sleep automatically?",
-                              "Разрешить LidAwake управлять сном автоматически?")
-        alert.informativeText = L(
-            "LidAwake can switch lid-close sleep for AC and battery on its own. "
-                + "This needs a one-time admin approval so it never asks for your password again.",
-            "LidAwake может сам переключать режим сна при закрытии крышки для питания от сети и от "
-                + "батареи. Для этого нужно однократное подтверждение администратора, чтобы пароль "
-                + "больше никогда не запрашивался.")
-        alert.addButton(withTitle: L("Enable", "Включить"))
-        alert.addButton(withTitle: L("Not Now", "Не сейчас"))
-        if alert.runModal() == .alertFirstButtonReturn { installSudoersRule() }
-    }
-
-    func installSudoersRule() {
-        // Scoped NOPASSWD rule: only `pmset … disablesleep`, nothing else.
-        let rule = "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep *,"
-            + " /usr/bin/pmset -b disablesleep *, /usr/bin/pmset -c disablesleep *"
-        // Validate with `visudo -cf` before installing — a malformed file would break sudo.
-        // No double quotes in this command, so it embeds cleanly in the AppleScript string.
-        let sh = "f=$(mktemp) && echo '\(rule)' > $f && /usr/sbin/visudo -cf $f"
-            + " && /usr/bin/install -m 0440 -o root -g wheel $f \(sudoersPath); rm -f $f"
-        runAdmin(sh)
-    }
-
-    // MARK: - Shell helpers
-
-    @discardableResult
-    func shell(_ launchPath: String, _ args: [String]) -> String {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: launchPath)
-        task.arguments = args
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        try? task.run()
-        task.waitUntilExit()
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    }
-
-    // Run a shell command as root via the Apple-signed osascript (reliable from an
-    // ad-hoc-signed app, unlike in-process NSAppleScript). Inner quotes are escaped for AppleScript.
-    @discardableResult
-    func runAdmin(_ shellCmd: String) -> Bool {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        task.arguments = ["-e", "do shell script \"\(shellCmd)\" with administrator privileges"]
-        let errPipe = Pipe()
-        task.standardError = errPipe
-        try? task.run()
-        task.waitUntilExit()
-        if task.terminationStatus != 0 {
-            let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            if msg.contains("-128") || msg.contains("User canceled") { return false } // user hit Cancel
-            let alert = NSAlert()
-            alert.messageText = L("LidAwake couldn't change the setting",
-                                 "Не удалось изменить настройку")
-            alert.informativeText = msg.isEmpty ? L("Unknown error", "Неизвестная ошибка") : msg
-            alert.runModal()
-            return false
+        let source = state.onAC ? L("AC power", "От сети") : L("Battery", "От батареи")
+        let status = state.awake.map { $0 ? L("Staying awake", "Не засыпает") : L("Sleep enabled", "Сон разрешён") }
+            ?? L("Sleep status unavailable", "Состояние сна недоступно")
+        entries.append(MenuEntry(id: "enabled", title: "LidAwake", action: #selector(toggleEnabled),
+                                 keyEquivalent: "e", state: state.policy.isEnabled ? .on : .off,
+                                 enabled: controlsEnabled, style: .toggle,
+                                 subtitle: "\(status) · \(source)", symbol: sleepSymbol))
+        if state.error != nil {
+            item("error", L("Sleep setting needs attention…", "Проверьте настройку сна…"), #selector(showSleepError))
         }
-        return true
+        entries.append(.separator("power-separator"))
+        item("power-heading", L("Keep awake when:", "Не засыпать:"))
+        item("ac", L("Connected to Power", "При питании от сети"), #selector(toggleAC), checked: state.policy.onAC, enabled: awakeControlsEnabled, indent: 1, symbol: "powerplug.fill")
+        item("battery", L("On Battery", "При питании от батареи"), #selector(toggleBattery), checked: state.policy.onBattery, enabled: awakeControlsEnabled, indent: 1, symbol: "battery.100")
+        entries.append(.separator("display-separator"))
+        item("external", L("Turn Off External Display on Lid Close", "Выключать внешний дисплей при закрытии крышки"), #selector(toggleExternal), checked: offExternal, enabled: awakeControlsEnabled)
+        entries.append(.separator("setup-separator"))
+        item("setup", state.setupReady ? L("Repair Sleep Setup…", "Исправить настройку сна…") : L("Enable Automatic Sleep Control…", "Включить автоматическое управление сном…"), #selector(setupSleep), enabled: controlsEnabled)
+        entries.append(.separator("login-separator"))
+        item("login", L("Launch at Login", "Запускать при входе"), #selector(toggleLogin), key: "l", checked: state.loginEnabled, enabled: controlsEnabled)
+        entries.append(.separator("about-separator"))
+        item("about", L("About LidAwake", "О LidAwake"), #selector(showAbout))
+        item("updates", checkingUpdates ? L("Checking for Updates…", "Проверка обновлений…") : L("Check for Updates…", "Проверить обновления…"), #selector(checkForUpdates), enabled: !checkingUpdates)
+        item("github", L("LidAwake on GitHub", "LidAwake на GitHub"), #selector(openGitHub))
+        entries.append(.separator("quit-separator"))
+        item("quit", L("Quit", "Выйти"), #selector(quitApp), key: "q", enabled: !terminating)
+        menuRenderer?.update(entries, target: self)
     }
 
-    // MARK: - UI
-
-    func updateUI() {
-        awake = liveAwake()
-        updateIcon()
-        rebuildMenu()
-    }
-
-    // Coffee cup when staying awake, sleeping moon otherwise.
-    func updateIcon() {
-        let symbol = awake ? "cup.and.saucer.fill" : "moon.zzz"
-        let desc = awake ? L("Staying awake", "Не засыпает")
-                         : L("Sleeps on lid close", "Засыпает при закрытии крышки")
-        guard let button = statusItem.button else { return }
-        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: desc) {
-            img.isTemplate = true // recolors itself for light/dark menu bar
-            button.image = img
-            button.title = ""
-        } else {
-            button.image = nil // SF Symbols missing: fall back to a unicode glyph
-            button.title = awake ? "\u{2615}" : "\u{263E}"
-        }
-    }
-
-    func rebuildMenu() {
-        let menu = statusItem.menu!
-        menu.removeAllItems()
-        let onAC = onACPower()
-        let src = onAC ? L("On AC power", "От сети") : L("On battery", "От батареи")
-        let state = awake ? L("staying awake", "не засыпает")
-                          : L("sleeps on lid close", "засыпает при закрытии крышки")
-        let status = NSMenuItem(title: "\(src) · \(state)", action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
-        menu.addItem(.separator())
-        let ac = NSMenuItem(title: L("Stay Awake on AC Power", "Не засыпать при питании от сети"), action: #selector(toggleAC), keyEquivalent: "")
-        ac.state = awakeOnAC ? .on : .off
-        menu.addItem(ac)
-        let bat = NSMenuItem(title: L("Stay Awake on Battery", "Не засыпать при питании от батареи"), action: #selector(toggleBattery), keyEquivalent: "")
-        bat.state = awakeOnBattery ? .on : .off
-        menu.addItem(bat)
-        let ext = NSMenuItem(title: L("Turn Off External Display on Lid Close", "Выключать внешний дисплей при закрытии крышки"), action: #selector(toggleExternal), keyEquivalent: "")
-        ext.state = offExternalOnLidClose ? .on : .off
-        menu.addItem(ext)
-        menu.addItem(.separator())
-        let login = NSMenuItem(title: L("Launch at Login", "Запускать при входе"), action: #selector(toggleLaunchAtLogin), keyEquivalent: "l")
-        login.state = loginEnabled ? .on : .off
-        menu.addItem(login)
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: L("Quit", "Выйти"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-    }
+    @objc private func quitApp() { NSApp.terminate(nil) }
 
     func menuWillOpen(_ menu: NSMenu) {
-        loginEnabled = loginItemExists()
+        perform { $0.refreshLogin() }
+    }
+
+    @objc private func toggleEnabled() {
+        guard pendingUserOperations == 0 && !terminating else { return }
+        if !state.policy.isEnabled && !state.setupReady {
+            promptSetup { [weak self] in self?.toggleEnabled() }
+        } else {
+            perform({ try $0.controller.setEnabled(!$0.controller.policy.isEnabled) }, showFailure: true)
+        }
+    }
+    @objc private func toggleAC() { toggle(onAC: true) }
+    @objc private func toggleBattery() { toggle(onAC: false) }
+    private func toggle(onAC: Bool) {
+        guard state.policy.isEnabled && pendingUserOperations == 0 && !terminating else { return }
+        let enabling = !(onAC ? state.policy.onAC : state.policy.onBattery)
+        if enabling && !state.setupReady {
+            promptSetup { [weak self] in self?.toggle(onAC: onAC) }
+        } else { perform({ try $0.controller.toggle(onAC: onAC) }, showFailure: true) }
+    }
+    @objc private func toggleExternal() {
+        guard state.policy.isEnabled && pendingUserOperations == 0 && !terminating else { return }
+        offExternal.toggle()
         updateUI()
     }
-
-    // MARK: - Actions
-
-    @objc func toggleAC() { awakeOnAC.toggle(); applyForCurrentSource(auto: false) }
-    @objc func toggleBattery() { awakeOnBattery.toggle(); applyForCurrentSource(auto: false) }
-    @objc func toggleExternal() { offExternalOnLidClose.toggle(); rebuildMenu() }
-
-    // MARK: - Login item (via System Events)
-
-    func loginItemExists() -> Bool {
-        shell("/usr/bin/osascript", ["-e",
-            "tell application \"System Events\" to return (exists login item \"LidAwake\")"]).contains("true")
+    @objc private func setupSleep() { promptSetup() }
+    private func promptSetup(afterSuccess: (() -> Void)? = nil) {
+        statusItem.menu?.cancelTracking()
+        let alert = NSAlert()
+        alert.messageText = L("Let LidAwake manage sleep automatically?", "Разрешить LidAwake управлять сном автоматически?")
+        alert.informativeText = L(
+            "One admin approval lets LidAwake switch sleep on AC and battery and restore sleep when you quit or the menu app crashes. Only the two sleep-toggle commands are allowed without a password. Existing LidAwake rules will be narrowed to those commands.",
+            "Однократное подтверждение администратора позволит переключать сон при смене питания и восстанавливать его при выходе или сбое приложения. Без пароля разрешены только две команды переключения сна. Старые правила LidAwake будут ограничены этими командами.")
+        alert.addButton(withTitle: L("Enable", "Включить"))
+        alert.addButton(withTitle: L("Not Now", "Не сейчас"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        perform({ runtime in
+            try runtime.setup.install()
+            try runtime.controller.reconcile()
+        }, showFailure: true, completion: { error in if error == nil { afterSuccess?() } })
     }
-
-    @objc func toggleLaunchAtLogin() {
-        // `hidden:true` launches without stealing focus. First use prompts once for Automation access.
-        let script = loginEnabled
-            ? "tell application \"System Events\" to delete login item \"LidAwake\""
-            : "tell application \"System Events\" to make login item at end with properties {path:\"/Applications/LidAwake.app\", hidden:true}"
-        _ = shell("/usr/bin/osascript", ["-e", script])
-        loginEnabled = loginItemExists()
-        rebuildMenu()
+    @objc private func toggleLogin() {
+        perform({ runtime in
+            do {
+                try runtime.login.setEnabled(!runtime.login.isEnabled())
+                runtime.refreshLogin()
+            } catch {
+                runtime.refreshLogin()
+                throw error
+            }
+        }, showFailure: true, affectsSleep: false)
+    }
+    @objc private func showSleepError() { showError(state.error ?? L("Unknown error", "Неизвестная ошибка")) }
+    private func showError(_ message: String) {
+        statusItem.menu?.cancelTracking()
+        let alert = NSAlert()
+        alert.messageText = L("LidAwake needs attention", "LidAwake требует внимания")
+        alert.informativeText = message
+        alert.runModal()
+    }
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        let credits = NSMutableAttributedString(string: L("Developed by ", "Разработчик: ") + ProjectInfo.developer + "\n")
+        credits.append(NSAttributedString(string: ProjectInfo.repository.absoluteString,
+                                          attributes: [.link: ProjectInfo.repository]))
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits, .applicationVersion: version])
+    }
+    @objc private func openGitHub() { NSWorkspace.shared.open(ProjectInfo.repository) }
+    @objc private func checkForUpdates() {
+        checkingUpdates = true
+        updateMenu()
+        Task { @MainActor in
+            defer { checkingUpdates = false; updateMenu() }
+            do {
+                let result = try await GitHubUpdates().check(currentVersion: version)
+                let alert = NSAlert()
+                switch result {
+                case .available(let latest, let url):
+                    alert.messageText = L("LidAwake \(latest) is available", "Доступен LidAwake \(latest)")
+                    alert.informativeText = L("You’re running \(version). Open the release page to download the update.",
+                                             "У вас версия \(version). Откройте страницу релиза, чтобы скачать обновление.")
+                    alert.addButton(withTitle: L("Open Release", "Открыть релиз"))
+                    alert.addButton(withTitle: L("Later", "Позже"))
+                    if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(url) }
+                case .current:
+                    alert.messageText = L("LidAwake is up to date", "LidAwake обновлён")
+                    alert.informativeText = L("You’re running version \(version).", "У вас версия \(version).")
+                    alert.runModal()
+                case .noReleases:
+                    alert.messageText = L("No releases available yet", "Релизов пока нет")
+                    alert.informativeText = L("There are no public releases on GitHub yet.", "На GitHub пока нет публичных релизов.")
+                    alert.runModal()
+                }
+            } catch { showError(error.localizedDescription) }
+        }
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+@main
+struct LidAwakeMain {
+    static func main() {
+        signal(SIGPIPE, SIG_IGN)
+        if CommandLine.arguments.dropFirst() == ["--sleep-worker"] { exit(SleepWorker.run()) }
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        withExtendedLifetime(delegate) { app.run() }
+    }
+}

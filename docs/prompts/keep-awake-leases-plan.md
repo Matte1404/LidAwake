@@ -1,5 +1,22 @@
 # Keep-Awake Leases — plan
 
+> **Safety correction (2026-09-14; takes precedence over the plan below).**
+> A live interactive process does not prove that a turn is still active. Every lease,
+> including a verified lease, must have a finite expiry. Start with a **6-hour maximum
+> hold**, show the expiry in the menu, and allow explicit renewal. PID checks may end a
+> lease early; they must never extend its expiry. Interrupted or failed turns without a
+> release can therefore delay sleep until expiry, but cannot strand the Mac indefinitely.
+> Work longer than the maximum hold requires explicit renewal; do not promise unlimited
+> runtime. A future integration may renew from a documented, verified work signal, never
+> from PID liveness alone. Immediate cleanup on interrupt remains a validation gate.
+>
+> The app now uses a pipe-connected sleep worker: it is the sole `pmset` writer, restores
+> its owned override on GUI exit/EOF, and journals recovery before enabling it. Leases
+> must use that existing control path. If both processes die or permission is revoked,
+> the next launch retries the journaled restoration; shutdown is not inherently safe
+> just because no coordinator is running. Automatic setup is required before enabling
+> keep-awake. The lease feature itself is still a plan, not a shipped integration.
+
 ## Goal / user story
 
 > I run coding CLIs (Claude Code today; codex/aider/etc. later) in a few terminal tabs,

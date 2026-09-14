@@ -14,16 +14,29 @@ A focused, closed-lid alternative to **Amphetamine** / **Caffeine**.
 
 ## Features
 
-- ☕ / 🌙 **menu bar toggle** — stay awake vs. sleep on lid close, at a glance.
+- **LidAwake switch** — pause or resume sleep prevention without clearing your AC, battery, or display preferences. The choice survives relaunches.
+- ☕ / 🌙 **menu bar status** — staying awake vs. sleep enabled, at a glance.
 - **Per power source** — independent AC and battery policies; auto-applied on plug/unplug.
 - **Screen off when closed** — blanks the internal panel on lid close, and the external monitor too (uncheck the toggle to keep clamshell mode and leave the external on).
-- **Launch at Login** (`⌘L`) — starts hidden in the menu bar.
-- Live status line, e.g. *“On battery · sleeps on lid close”*.
+- **Launch at Login** (`⌘L`) — starts the installed copy, including outside `/Applications`.
+- **Sleep restoration** — quitting restores the app's sleep override; a background worker also restores it if the menu app crashes.
+- **Manual update checks** — “Check for Updates…” checks [GitHub Releases](https://github.com/TurboKach/LidAwake/releases) and offers the newer release page.
+- **Developer credits** — “About LidAwake” credits [TurboKach](https://github.com/TurboKach) and links to the source.
+- Readable live status below the master switch, e.g. *“Sleep enabled · Battery”*.
+
+Use the **LidAwake** switch at the top of the menu as the master control (`⌘E` while the
+menu is open), then choose **Connected to Power** and/or
+**On Battery** under **Keep awake when:**. With only AC selected, unplugging allows
+sleep and reconnecting keeps the Mac awake again. Turning the master off restores
+sleep, stops LidAwake's display blanking, and dims the dependent controls while keeping
+their selections. Setup, login, and update actions remain available. Existing installs
+retain their saved power-source choices with the master enabled on first upgrade.
 
 ## How it works
 
 Toggles `pmset disablesleep` (`0` = sleep, `1` = stay awake) — one live, system-wide
-value, so LidAwake watches power changes and applies your per-source policy itself. On lid
+value, so LidAwake watches power changes and applies your per-source policy itself. A
+single background worker owns these writes. On lid
 close it runs `pmset displaysleepnow` to blank the internal screen — and the external one
 too, unless you keep clamshell mode on. Requires **macOS 12+**.
 
@@ -38,14 +51,49 @@ too, unless you keep clamshell mode on. Requires **macOS 12+**.
    - Open it → click **Done** (*not* Move to Trash) → **System Settings → Privacy & Security → Open Anyway**, or
    - run `xattr -dr com.apple.quarantine /Applications/LidAwake.app`
 
-**First run** installs a scoped passwordless rule at `/etc/sudoers.d/lidawake` (limited to
-`pmset … disablesleep`, validated with `visudo`) so it can switch silently. Click *Not Now*
-to skip and it'll ask for your password each time instead. Remove later with
-`sudo rm /etc/sudoers.d/lidawake`.
+**First run** offers a scoped passwordless rule at `/etc/sudoers.d/lidawake-<your UID>`.
+It allows exactly `/usr/bin/pmset -a disablesleep 0` and `... disablesleep 1`, validated
+with `visudo`. Setup is required before enabling keep-awake so crash recovery can restore
+sleep without a password prompt. “Not Now” leaves keep-awake unavailable; setup remains
+accessible from the menu. “Repair Sleep Setup…” also migrates the old wildcard rule,
+preserving its account while narrowing its permissions.
+
+Quit the old app before running an updated copy. Only one new LidAwake session can own
+sleep control at a time. Avoid using another `disablesleep` manager concurrently.
+
+If restoring sleep fails, Quit offers to stay open and repair setup. If the menu app
+crashes, the worker restores sleep independently. If both processes die, or permission
+is revoked, a private recovery marker survives and restoration is retried on next launch.
+This cannot guarantee immediate restoration after both processes fail. The menu reports
+failed changes and unavailable status instead of treating a failed read as sleep enabled.
+
+To uninstall, quit LidAwake first, confirm sleep is enabled, then remove its rule with
+`sudo rm "/etc/sudoers.d/lidawake-$(id -u)"`. An older installation may also have
+`/etc/sudoers.d/lidawake`; remove that only if it is no longer used by another account.
+If necessary, restore sleep manually with `sudo pmset -a disablesleep 0`.
 
 ## Build
 
 ```sh
-./build.sh     # compile + bundle + install to /Applications
-./release.sh   # universal (arm64 + Intel) LidAwake.dmg for distribution
+./build.sh                 # compile + bundle + install to /Applications
+./build.sh --no-install    # build a local app without installing
+swift test                # regression tests with simulated power settings
+./release.sh              # universal (arm64 + Intel) LidAwake.dmg
+./scripts/check-build.sh universal  # verify the universal bundle and macOS 12 target
 ```
+
+Both build paths use `Package.swift` for the macOS 12 deployment target and `Info.plist`
+for bundle metadata. Before publishing a new release, increment `CFBundleShortVersionString`
+and `CFBundleVersion` in `Info.plist`; use a corresponding GitHub release tag such as
+`v1.2.0`. The update checker compares numeric stable versions, accepts an optional `v`
+prefix, and never downloads or installs anything automatically. It contacts GitHub only
+when you choose “Check for Updates…”.
+
+The macOS CI workflow runs regression tests and verifies both architectures. See
+[manual validation](docs/testing.md) for checks that require a real MacBook and displays.
+The keep-awake lease integration in `docs/prompts/` remains a future feature.
+
+## Credits
+
+Developed by [TurboKach](https://github.com/TurboKach).
+Source and releases: [TurboKach/LidAwake](https://github.com/TurboKach/LidAwake).

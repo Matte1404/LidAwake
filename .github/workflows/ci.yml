@@ -1,0 +1,21 @@
+name: macOS checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell scripts
+        run: bash -n build.sh release.sh make-icon.sh scripts/*.sh
+      - name: Run regression tests
+        run: swift test
+      - name: Verify recovery after process death
+        run: ./scripts/test-recovery.sh
+      - name: Build universal app
+        run: ./scripts/build-app.sh universal
+      - name: Verify bundle and deployment targets
+        run: ./scripts/check-build.sh universal

@@ -6,3 +6,8 @@
 
 # macOS
 .DS_Store
+/.build/
+/.swiftpm/
+/LidAwake-arm64
+/LidAwake-x86_64
+/rw.dmg

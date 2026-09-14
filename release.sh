@@ -10,50 +10,7 @@ DMG="LidAwake.dmg"
 VOLNAME="LidAwake"
 STAGING="dmg-staging"
 
-echo "Compiling universal binary (arm64 + x86_64)…"
-swiftc LidAwake.swift -target arm64-apple-macos12  -o LidAwake-arm64 \
-    -framework Cocoa -framework IOKit -framework CoreGraphics
-swiftc LidAwake.swift -target x86_64-apple-macos12 -o LidAwake-x86_64 \
-    -framework Cocoa -framework IOKit -framework CoreGraphics
-lipo -create -output LidAwake LidAwake-arm64 LidAwake-x86_64
-rm -f LidAwake-arm64 LidAwake-x86_64
-echo -n "  → "; lipo -archs LidAwake
-
-echo "Building $APP bundle…"
-rm -rf "$APP"
-mkdir -p "$CONTENTS/MacOS"
-cp LidAwake "$CONTENTS/MacOS/LidAwake"
-
-cat > "$CONTENTS/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>           <string>LidAwake</string>
-    <key>CFBundleExecutable</key>     <string>LidAwake</string>
-    <key>CFBundleIdentifier</key>     <string>local.lidawake</string>
-    <key>CFBundlePackageType</key>    <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>1.1</string>
-    <key>CFBundleIconFile</key>       <string>AppIcon</string>
-    <key>LSMinimumSystemVersion</key> <string>12.0</string>
-    <key>LSUIElement</key>            <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>LidAwake uses System Events to manage its Login Items entry.</string>
-</dict>
-</plist>
-PLIST
-
-if [ ! -f AppIcon.icns ]; then
-    echo "AppIcon.icns missing — run ./make-icon.sh first." >&2; exit 1
-fi
-mkdir -p "$CONTENTS/Resources"
-cp AppIcon.icns "$CONTENTS/Resources/AppIcon.icns"
-
-# Ad-hoc sign so the bundle has a stable code signature (no Developer ID,
-# so users still clear Gatekeeper manually — see README "Install").
-echo "Ad-hoc signing ${APP}…"
-codesign --force --deep --sign - "$APP"
-codesign --verify --verbose "$APP"
+./scripts/build-app.sh universal
 
 # ---- Styled DMG: gradient background with a drag-to-Applications arrow ----
 WIN_W=620; WIN_H=400          # Finder window content size, in points

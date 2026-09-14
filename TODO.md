@@ -3,7 +3,9 @@
 ## Auto-off when watched processes finish
 
 Let LidAwake stay awake only as long as specific work is running, then turn
-itself off automatically.
+itself off automatically. This remains planned; see the
+[lease plan](docs/prompts/keep-awake-leases-plan.md), including the requirement for finite
+expiry even when an interactive owner process remains alive after an interruption.
 
 **Behavior:**
 - Keep a user-defined list of apps/processes to watch (e.g. `ffmpeg`, `Xcode`,
@@ -36,8 +38,8 @@ itself off automatically.
 ## ✅ Per-power-source behavior (AC vs. battery) — DONE
 
 Implemented: independent AC/battery policies in the menu, IOKit power-source
-monitoring with automatic switching, and a one-time passwordless setup so it
-applies silently. Notes below kept for context.
+monitoring plus reconciliation in common run-loop modes, and exact passwordless commands.
+A background worker restores sleep on GUI exit and journals recovery before enabling it. Notes below kept for context.
 
 Let the lid-close-awake behavior differ depending on whether the Mac is on
 charger or on battery, so e.g. it stays awake when plugged in but always
@@ -51,9 +53,9 @@ sleeps on battery (to protect battery life / avoid a hot bag).
 - Reflect the active source + its policy in the menu.
 
 **Implementation notes:**
-- `pmset` already separates sources: `-c` = AC/charger, `-b` = battery,
-  `-a` = all. Today the app only writes `-c disablesleep`, so battery is
-  untouched. To honor a battery policy, write `-b disablesleep <0|1>` too.
+- `disablesleep` is a single global setting, even when `-b` or `-c` is supplied.
+  LidAwake stores both source policies itself and sends the current source's desired
+  value to its sole sleep worker using `pmset -a disablesleep <0|1>`.
 - Detect the current source and live changes via `IOPSNotificationCreateRunLoopSource`
   / `IOPSCopyPowerSourcesInfo` (IOKit), or poll `pmset -g batt`.
 - Read state per source from `pmset -g` accordingly (note: `SleepDisabled` is a
