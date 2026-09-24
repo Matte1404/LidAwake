@@ -25,21 +25,55 @@ private struct MenuState {
 /// All blocking work and mutable power policy live on AppDelegate.workQueue.
 private final class AppRuntime {
     let runner = ProcessCommandRunner()
-    let sleep = SleepWorkerClient(executable: Bundle.main.executableURL!)
+    private(set) var sleep = SleepWorkerClient(executable: Bundle.main.executableURL!)
     lazy var setup = PrivilegeSetup(runner: runner)
     lazy var login = LoginItems(runner: runner, bundleURL: Bundle.main.bundleURL)
-    lazy var controller = PolicyController(
+    private(set) lazy var controller = makeController(
         policy: SleepPolicy(isEnabled: UserDefaults.standard.bool(forKey: "lidAwakeEnabled"),
                             onAC: UserDefaults.standard.bool(forKey: "awakeOnAC"),
-                            onBattery: UserDefaults.standard.bool(forKey: "awakeOnBattery")),
-        sleep: sleep, onACPower: onACPower,
-        persist: { policy in
+                            onBattery: UserDefaults.standard.bool(forKey: "awakeOnBattery")))
+    var loginEnabled: Bool?
+    var loginError: String?
+
+    private func makeController(policy: SleepPolicy) -> PolicyController {
+        PolicyController(policy: policy, sleep: sleep, onACPower: onACPower, persist: { policy in
             UserDefaults.standard.set(policy.isEnabled, forKey: "lidAwakeEnabled")
             UserDefaults.standard.set(policy.onAC, forKey: "awakeOnAC")
             UserDefaults.standard.set(policy.onBattery, forKey: "awakeOnBattery")
         })
-    var loginEnabled: Bool?
-    var loginError: String?
+    }
+
+    /// Turns off the login item, stops the worker, then restores sleep and removes the sudoers
+    /// rules with one admin prompt. Failures report what was actually removed; while any rule
+    /// remains a new worker takes over. Returns true when the legacy rule was left in place.
+    func uninstallApp() throws -> Bool {
+        let uninstaller = Uninstaller(login: login, rules: setup, dataDirectory: FileManager.default
+            .homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/LidAwake", isDirectory: true))
+        do {
+            return try uninstaller.run(stopSleep: { try controller.stop() }, resumeSleep: {
+                // The stopped worker has exited, so the new one can take the session lock.
+                let worker = SleepWorkerClient(executable: Bundle.main.executableURL!)
+                try worker.start()
+                sleep = worker
+                controller = makeController(policy: controller.policy)
+            }, removeSettings: {
+                if let domain = Bundle.main.bundleIdentifier { UserDefaults.standard.removePersistentDomain(forName: domain) }
+            })
+        } catch Uninstaller.Failure.nothingRemoved(let cause, let loginItemOff) {
+            if cause as? ControlError == .canceled && !loginItemOff { throw cause }
+            let login = loginItemOff ? L(" Nothing else was removed, but Launch at Login is now off; turn it back on from the menu.",
+                                         " Больше ничего не удалено, но запуск при входе теперь выключен; включите его снова в меню.")
+                                     : L(" Nothing was removed.", " Ничего не было удалено.")
+            throw ControlError.message(L("LidAwake was not uninstalled.", "LidAwake не удалён.") + login + "\n\n" + cause.localizedDescription)
+        } catch Uninstaller.Failure.incomplete(let remaining, let cause) {
+            throw ControlError.message(L("LidAwake was only partly uninstalled. These items remain:\n",
+                                         "LidAwake удалён не полностью. Остались:\n")
+                + remaining.joined(separator: "\n")
+                + L("\n\nRemove them manually (for files in /etc/sudoers.d, run “sudo rm <path>” in Terminal), or fix the cause and choose Uninstall LidAwake… again.\n\n",
+                    "\n\nУдалите их вручную (для файлов в /etc/sudoers.d выполните в Терминале «sudo rm <путь>») или устраните причину и снова выберите «Удалить LidAwake…».\n\n")
+                + cause.localizedDescription)
+        }
+    }
 
     func refreshLogin() {
         do { loginEnabled = try login.isEnabled(); loginError = nil }
@@ -262,6 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item("external", L("Turn Off External Display on Lid Close", "Выключать внешний дисплей при закрытии крышки"), #selector(toggleExternal), checked: offExternal, enabled: awakeControlsEnabled)
         entries.append(.separator("setup-separator"))
         item("setup", state.setupReady ? L("Repair Sleep Setup…", "Исправить настройку сна…") : L("Enable Automatic Sleep Control…", "Включить автоматическое управление сном…"), #selector(setupSleep), enabled: controlsEnabled)
+        item("uninstall-app", L("Uninstall LidAwake…", "Удалить LidAwake…"), #selector(uninstallApp), enabled: controlsEnabled)
         entries.append(.separator("login-separator"))
         item("login", L("Launch at Login", "Запускать при входе"), #selector(toggleLogin), key: "l", checked: state.loginEnabled, enabled: controlsEnabled)
         entries.append(.separator("about-separator"))
@@ -316,6 +351,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try runtime.setup.install()
             try runtime.controller.reconcile()
         }, showFailure: true, completion: { error in if error == nil { afterSuccess?() } })
+    }
+    @objc private func uninstallApp() {
+        statusItem.menu?.cancelTracking()
+        let alert = NSAlert()
+        alert.messageText = L("Uninstall LidAwake?", "Удалить LidAwake?")
+        alert.informativeText = L(
+            "LidAwake restores normal sleep, then removes:\n• its sleep rules /etc/sudoers.d/lidawake-\(getuid()) and, if it names this account, /etc/sudoers.d/lidawake (macOS asks for an administrator password)\n• its login item\n• its settings and ~/Library/Application Support/LidAwake\n• the app itself, moved to the Trash\n\nThen LidAwake quits.",
+            "LidAwake восстановит обычный сон, затем удалит:\n• свои правила сна /etc/sudoers.d/lidawake-\(getuid()) и, если оно указывает эту учётную запись, /etc/sudoers.d/lidawake (macOS запросит пароль администратора)\n• свой объект входа\n• свои настройки и ~/Library/Application Support/LidAwake\n• само приложение — оно будет перемещено в Корзину\n\nЗатем LidAwake завершит работу.")
+        alert.addButton(withTitle: L("Uninstall", "Удалить"))
+        alert.addButton(withTitle: L("Cancel", "Отмена"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var keptLegacyRule = false
+        perform({ runtime in
+            do { keptLegacyRule = try runtime.uninstallApp() } catch {
+                // The new worker applies the policy again; its failure shows in the menu status,
+                // never in place of what the uninstall actually did.
+                try? runtime.controller.reconcile()
+                throw error
+            }
+        }, showFailure: true, completion: { [weak self] error in
+            guard let self = self else { return }
+            if error as? ControlError == .canceled {
+                self.showError(L("Uninstall was canceled. Nothing was removed.", "Удаление отменено. Ничего не было удалено."))
+            }
+            guard error == nil else { return }
+            if keptLegacyRule {
+                self.showError(L("LidAwake was uninstalled. Left /etc/sudoers.d/lidawake in place because it belongs to another account or has content LidAwake does not recognize.",
+                                 "LidAwake удалён. Файл /etc/sudoers.d/lidawake оставлен на месте: он принадлежит другой учётной записи или содержит то, что LidAwake не распознаёт."))
+            }
+            NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, error in
+                DispatchQueue.main.async {
+                    if let error = error {
+                        self.showError(L("LidAwake was uninstalled, but the app could not be moved to the Trash. Move it to the Trash yourself.\n\n",
+                                         "LidAwake удалён, но приложение не удалось переместить в Корзину. Переместите его в Корзину вручную.\n\n") + error.localizedDescription)
+                    }
+                    NSApp.terminate(nil)
+                }
+            }
+        })
     }
     @objc private func toggleLogin() {
         perform({ runtime in

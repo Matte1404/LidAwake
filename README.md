@@ -67,7 +67,14 @@ is revoked, a private recovery marker survives and restoration is retried on nex
 This cannot guarantee immediate restoration after both processes fail. The menu reports
 failed changes and unavailable status instead of treating a failed read as sleep enabled.
 
-To uninstall, quit LidAwake first, confirm sleep is enabled, then remove its rule with
+To uninstall, choose “Uninstall LidAwake…” from the menu. It restores sleep, removes
+`/etc/sudoers.d/lidawake-<uid>` and the legacy `/etc/sudoers.d/lidawake` after one admin
+prompt (the legacy rule only if it names your account; otherwise it is left in place and
+LidAwake says so), turns off Launch at Login, deletes its settings and
+`~/Library/Application Support/LidAwake`, moves the app to the Trash, and quits. Canceling
+the admin prompt removes nothing; if a step fails, LidAwake stops there and lists what remains.
+
+To uninstall manually instead, quit LidAwake first, confirm sleep is enabled, then remove its rule with
 `sudo rm "/etc/sudoers.d/lidawake-$(id -u)"`. An older installation may also have
 `/etc/sudoers.d/lidawake`; remove that only if it is no longer used by another account.
 If necessary, restore sleep manually with `sudo pmset -a disablesleep 0`.

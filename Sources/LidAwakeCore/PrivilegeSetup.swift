@@ -40,11 +40,69 @@ public final class PrivilegeSetup {
         guard isInstalled else { throw ControlError.message("Sleep setup could not be verified. Try Repair Sleep Setup.") }
     }
 
+    /// This account's and the legacy rule files that still exist, symbolic links included.
+    public var remainingRules: [String] {
+        [path, legacyPath].filter { (try? FileManager.default.attributesOfItem(atPath: $0)) != nil }
+    }
+
+    /// Restores sleep as root, then removes this account's rule and the legacy rule with one
+    /// admin prompt; after the rules are gone nothing of this account can restore it. The script
+    /// checks both rules before removing either, and the result is verified from the file system.
+    /// The legacy rule is removed only if it is a known LidAwake rule naming this account;
+    /// otherwise it is left in place and this returns true.
+    @discardableResult
+    public func uninstall() throws -> Bool {
+        let output = try runner.run("/usr/bin/osascript", ["-e",
+            "do shell script \(appleScriptString(uninstallationScript)) with administrator privileges"], timeout: 120)
+        let keptLegacy = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "kept-legacy"
+        let remaining = remainingRules.filter { !(keptLegacy && $0 == legacyPath) }
+        guard remaining.isEmpty else {
+            throw ControlError.message("Sleep rules were not removed: " + remaining.joined(separator: ", "))
+        }
+        return keptLegacy
+    }
+
+    var uninstallationScript: String {
+        """
+        set -eu
+        for rule in \(shellString(path)) \(shellString(legacyPath)); do
+            if [ -L "$rule" ] || { [ -e "$rule" ] && [ ! -f "$rule" ]; }; then
+                echo "Refusing to remove $rule: it is not a regular file." >&2
+                exit 1
+            fi
+        done
+        legacy=
+        if [ -e \(shellString(legacyPath)) ]; then
+            legacy=keep
+            if [ "$(/usr/bin/awk 'END { print NR }' \(shellString(legacyPath)))" = 1 ] \\
+                && { /usr/bin/grep -Eq \(shellString(Self.oldPattern)) \(shellString(legacyPath)) \\
+                     || /usr/bin/grep -Eq \(shellString(Self.newPattern)) \(shellString(legacyPath)); } \\
+                && [ "$(/usr/bin/awk '{ print $1 }' \(shellString(legacyPath)))" = \(shellString(NSUserName())) ]; then
+                legacy=remove
+            fi
+        fi
+        /usr/bin/pmset -a disablesleep 0
+        if [ "$(/usr/bin/pmset -g | /usr/bin/awk '$1 == "SleepDisabled" { print $2 }')" != 0 ]; then
+            echo 'Sleep could not be restored; the sleep rules were kept.' >&2
+            exit 1
+        fi
+        /bin/rm -f \(shellString(path))
+        if [ "$legacy" = remove ]; then
+            /bin/rm -f \(shellString(legacyPath))
+        elif [ "$legacy" = keep ]; then
+            echo kept-legacy
+        fi
+        """
+    }
+
+    // The two historical shapes of the legacy rule, `<username> ALL=(root) NOPASSWD: …`.
+    private static let oldPattern = #"^([a-zA-Z0-9._-]+) ALL=\(root\) NOPASSWD: /usr/bin/pmset -a disablesleep \*, /usr/bin/pmset -b disablesleep \*, /usr/bin/pmset -c disablesleep \*$"#
+    private static let newPattern = #"^[a-zA-Z0-9._-]+ ALL=\(root\) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1$"#
+
     var installationScript: String {
         // Preserve a legacy rule's account while narrowing its commands. Refuse unknown
         // content instead of replacing a file that may have been edited by an administrator.
-        let oldPattern = #"^([a-zA-Z0-9._-]+) ALL=\(root\) NOPASSWD: /usr/bin/pmset -a disablesleep \*, /usr/bin/pmset -b disablesleep \*, /usr/bin/pmset -c disablesleep \*$"#
-        let newPattern = #"^[a-zA-Z0-9._-]+ ALL=\(root\) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1$"#
+        let oldPattern = Self.oldPattern, newPattern = Self.newPattern
         let replacement = #"\1 ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"#
         return """
         set -eu

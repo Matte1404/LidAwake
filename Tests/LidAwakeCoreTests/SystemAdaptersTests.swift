@@ -107,6 +107,120 @@ final class SystemAdaptersTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: target), "original")
     }
 
+    func testUninstallerRemovesThisAccountsAndLegacyRulesWithOneAdminPrompt() throws {
+        let quoted = directory.appendingPathComponent("it's \"sudoers\"")
+        try FileManager.default.createDirectory(at: quoted, withIntermediateDirectories: false)
+        let runner = RecordingRunner()
+        let setup = PrivilegeSetup(runner: runner, uid: 502, directory: quoted.path)
+        XCTAssertEqual(setup.path, quoted.path + "/lidawake-502")
+        let legacy = quoted.appendingPathComponent("lidawake")
+        let other = quoted.appendingPathComponent("lidawake-503")
+        for file in [setup.path, other.path] {
+            try "rule\n".write(toFile: file, atomically: true, encoding: .utf8)
+        }
+        try legacyRule(NSUserName()).write(to: legacy, atomically: true, encoding: .utf8)
+        try runUninstallScript(setup)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: setup.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: other.path)) // Another account's rule stays.
+        try runUninstallScript(setup) // Already removed.
+
+        try setup.uninstall()
+        XCTAssertEqual(runner.calls.count, 1)
+        XCTAssertEqual(runner.calls[0].0, "/usr/bin/osascript")
+        XCTAssertEqual(runner.calls[0].1, ["-e",
+            "do shell script \(appleScriptString(setup.uninstallationScript)) with administrator privileges"])
+    }
+
+    func testUninstallerRefusesSymlinksAndRemovesNothing() throws {
+        let setup = PrivilegeSetup(runner: RecordingRunner(), uid: 502, directory: directory.path)
+        let target = directory.appendingPathComponent("untouched")
+        try "original".write(to: target, atomically: true, encoding: .utf8)
+        for link in ["lidawake", "lidawake-502"] {
+            let path = directory.appendingPathComponent(link)
+            let sibling = directory.appendingPathComponent(link == "lidawake" ? "lidawake-502" : "lidawake")
+            try FileManager.default.createSymbolicLink(at: path, withDestinationURL: target)
+            try "rule\n".write(to: sibling, atomically: true, encoding: .utf8)
+            XCTAssertThrowsError(try runUninstallScript(setup))
+            XCTAssertEqual(try String(contentsOf: target), "original")
+            XCTAssertNotNil(try? FileManager.default.destinationOfSymbolicLink(atPath: path.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: sibling.path))
+            try FileManager.default.removeItem(at: path)
+            try FileManager.default.removeItem(at: sibling)
+        }
+    }
+
+    private func legacyRule(_ user: String, old: Bool = false) -> String {
+        old ? "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep *, /usr/bin/pmset -b disablesleep *, /usr/bin/pmset -c disablesleep *\n"
+            : "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1\n"
+    }
+
+    func testUninstallScriptRemovesTheLegacyRuleOnlyWhenItNamesThisAccount() throws {
+        let setup = PrivilegeSetup(runner: RecordingRunner(), uid: 502, directory: directory.path)
+        let legacy = directory.appendingPathComponent("lidawake")
+        let kept = [legacyRule("someone_else"), legacyRule("someone_else", old: true), legacyRule(NSUserName() + "x"),
+                    "rule\n", "", legacyRule(NSUserName()) + legacyRule(NSUserName()), "# " + legacyRule(NSUserName())]
+        for content in kept {
+            try "rule\n".write(toFile: setup.path, atomically: true, encoding: .utf8)
+            try content.write(to: legacy, atomically: true, encoding: .utf8)
+            XCTAssertEqual(try runUninstallScript(setup, sleepDisabled: 1).stdout, "kept-legacy\n", content)
+            XCTAssertEqual(setup.remainingRules, [legacy.path], content)
+            XCTAssertEqual(try String(contentsOf: legacy), content)
+        }
+        for content in [legacyRule(NSUserName()), legacyRule(NSUserName(), old: true)] {
+            try "rule\n".write(toFile: setup.path, atomically: true, encoding: .utf8)
+            try content.write(to: legacy, atomically: true, encoding: .utf8)
+            XCTAssertEqual(try runUninstallScript(setup).stdout, "", content)
+            XCTAssertEqual(setup.remainingRules, [], content)
+        }
+        XCTAssertEqual(try runUninstallScript(setup).stdout, "") // Nothing left.
+    }
+
+    /// Runs the uninstall script with a fake pmset whose SleepDisabled starts at `sleepDisabled`.
+    /// A sticky fake ignores writes, like a setting something else keeps re-applying.
+    @discardableResult
+    private func runUninstallScript(_ setup: PrivilegeSetup, sleepDisabled: Int = 0, sticky: Bool = false) throws -> (sleepDisabled: Int, stdout: String) {
+        let state = directory.appendingPathComponent("SleepDisabled")
+        let pmset = directory.appendingPathComponent("pmset")
+        try "\(sleepDisabled)".write(to: state, atomically: true, encoding: .utf8)
+        try """
+        #!/bin/sh
+        if [ "$1" = -g ]; then printf 'System-wide power settings:\\n SleepDisabled\\t%s\\n' "$(cat '\(state.path)')"
+        elif [ "$1 $2" = '-a disablesleep' ]; then \(sticky ? ":" : "printf %s \"$3\" > '\(state.path)'")
+        else exit 1; fi
+        """.write(to: pmset, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: pmset.path)
+        let script = setup.uninstallationScript // Only the pmset calls, not the legacy rule patterns.
+            .replacingOccurrences(of: "\n/usr/bin/pmset ", with: "\n\(pmset.path) ")
+            .replacingOccurrences(of: "$(/usr/bin/pmset ", with: "$(\(pmset.path) ")
+        defer { try? FileManager.default.removeItem(at: pmset) }
+        let output = try ProcessCommandRunner().run("/bin/sh", ["-c", script], timeout: 5)
+        return (Int(try String(contentsOf: state, encoding: .utf8))!, output.stdout)
+    }
+
+    func testUninstallScriptRestoresSleepBeforeRemovingTheRules() throws {
+        let setup = PrivilegeSetup(runner: RecordingRunner(), uid: 502, directory: directory.path)
+        try "rule\n".write(toFile: setup.path, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try runUninstallScript(setup, sleepDisabled: 1).sleepDisabled, 0)
+        XCTAssertEqual(setup.remainingRules, [])
+    }
+
+    func testUninstallScriptRemovesNothingWhenSleepCannotBeRestored() throws {
+        let setup = PrivilegeSetup(runner: RecordingRunner(), uid: 502, directory: directory.path)
+        try "rule\n".write(toFile: setup.path, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try runUninstallScript(setup, sleepDisabled: 1, sticky: true))
+        XCTAssertEqual(setup.remainingRules, [setup.path])
+    }
+
+    func testUninstallScriptChecksBothRulesBeforeRemovingEither() throws {
+        let setup = PrivilegeSetup(runner: RecordingRunner(), uid: 502, directory: directory.path)
+        try "rule\n".write(toFile: setup.path, atomically: true, encoding: .utf8)
+        let legacy = directory.appendingPathComponent("lidawake")
+        try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: false) // rm -f cannot remove it.
+        XCTAssertThrowsError(try runUninstallScript(setup))
+        XCTAssertEqual(setup.remainingRules, [setup.path, legacy.path])
+    }
+
     func testCommandRunnerHandlesLaunchFailureExitFailureAndCancellation() throws {
         let runner = ProcessCommandRunner()
         XCTAssertThrowsError(try runner.run("/missing/lidawake-command", [], timeout: 1))
