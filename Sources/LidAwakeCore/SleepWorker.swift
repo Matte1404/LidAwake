@@ -123,6 +123,15 @@ public final class SleepWorkerClient: SleepControlling {
         _ = try request(WorkerRequest(operation: .shutdown))
         closed = true
         try input.fileHandleForWriting.close()
+        // The worker holds the session lock until it exits, so a replacement
+        // started right after stop() must not race that exit.
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning {
+            guard Date() < deadline else {
+                throw ControlError.message("Sleep recovery is still shutting down. Try again in a moment.")
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
     }
 
     private func request(_ request: WorkerRequest) throws -> WorkerReply {

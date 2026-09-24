@@ -7,15 +7,15 @@ trap 'rm -rf "$WORK"' EXIT
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/module-cache"
 swiftc Sources/LidAwakeCore/*.swift Tests/RecoveryProcess/main.swift \
     -module-cache-path "$CLANG_MODULE_CACHE_PATH" -o "$WORK/recovery-test"
-for mode in quit crash crash-during-write; do
+for mode in quit handover crash crash-during-write; do
     export LIDAWAKE_RECOVERY_TEST_DIR="$WORK/$mode"
     mkdir -m 700 "$LIDAWAKE_RECOVERY_TEST_DIR"
     printf 0 > "$LIDAWAKE_RECOVERY_TEST_DIR/awake"
     if "$WORK/recovery-test" "$mode"; then
-        if [ "$mode" != quit ]; then echo "Expected simulated GUI death" >&2; exit 1; fi
+        if [ "$mode" != quit ] && [ "$mode" != handover ]; then echo "Expected simulated GUI death" >&2; exit 1; fi
     else
         status=$?
-        if [ "$mode" = quit ] || [ "$status" != 137 ]; then exit "$status"; fi
+        if [ "$mode" = quit ] || [ "$mode" = handover ] || [ "$status" != 137 ]; then exit "$status"; fi
     fi
     recovered=false
     for attempt in {1..50}; do

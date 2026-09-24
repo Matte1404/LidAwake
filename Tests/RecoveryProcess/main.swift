@@ -26,6 +26,7 @@ if mode == "--sleep-worker" {
             try? FileHandle.standardOutput.write(contentsOf: data)
         })
     }
+    Thread.sleep(forTimeInterval: 0.5) // A slow exit: the lock is still held after the shutdown reply.
     exit(status)
 }
 let client = SleepWorkerClient(executable: URL(fileURLWithPath: CommandLine.arguments[0]))
@@ -36,3 +37,9 @@ if mode == "crash-during-write" {
 try client.setAwake(true)
 if mode == "crash" { kill(getpid(), SIGKILL) }
 try client.stop()
+if mode == "handover" {
+    // A stop→start handover must not race the old worker's exit for the session lock.
+    let next = SleepWorkerClient(executable: URL(fileURLWithPath: CommandLine.arguments[0]))
+    try next.start()
+    try next.stop()
+}
