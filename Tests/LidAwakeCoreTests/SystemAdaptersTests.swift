@@ -36,6 +36,25 @@ final class SystemAdaptersTests: XCTestCase {
         XCTAssertEqual(runner.calls[1].1, ["-g"])
     }
 
+    func testPMSetProbeWritesTheCurrentValueInsteadOfListingPrivileges() throws {
+        let runner = RecordingRunner()
+        for value in ["0", "1"] {
+            runner.calls = []
+            runner.respond = { args in CommandOutput(stdout: args == ["-g"] ? "SleepDisabled \(value)" : "") }
+            try PMSet(runner: runner, setup: PrivilegeSetup(runner: runner)).probeRule()
+            XCTAssertEqual(runner.calls.map { [$0.0] + $0.1 }, [
+                ["/usr/bin/pmset", "-g"],
+                ["/usr/bin/sudo", "-n", "-k", "/usr/bin/pmset", "-a", "disablesleep", value]])
+        }
+    }
+
+    func testPMSetRequiresTheRuleFileBeforeProbing() {
+        let runner = RecordingRunner()
+        let pmset = PMSet(runner: runner, setup: PrivilegeSetup(runner: runner, uid: 502, directory: directory.path))
+        XCTAssertThrowsError(try pmset.requireAutomaticControl())
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
     func testPMSetReadPropagatesProcessFailureEvenWithValidLookingOutput() {
         let runner = RecordingRunner()
         runner.respond = { _ in throw ControlError.message("pmset unavailable") }

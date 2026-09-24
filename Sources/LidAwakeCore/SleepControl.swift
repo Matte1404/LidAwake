@@ -38,9 +38,13 @@ final class PMSet: PowerSettings {
         guard setup.isInstalled else {
             throw ControlError.message("Enable or repair Sleep Setup before turning on keep-awake.")
         }
-        for value in ["0", "1"] {
-            _ = try runner.run("/usr/bin/sudo", ["-n", "-k", "-l", "/usr/bin/pmset", "-a", "disablesleep", value], timeout: 10)
-        }
+        try probeRule()
+    }
+
+    /// `sudo -l` succeeds for any command once an admin account has any NOPASSWD rule,
+    /// so prove the rule by writing the current value, which changes nothing.
+    func probeRule() throws {
+        _ = try runner.run("/usr/bin/sudo", ["-n", "-k", "/usr/bin/pmset", "-a", "disablesleep", try read() ? "1" : "0"], timeout: 10)
     }
 
     func write(_ awake: Bool) throws {
