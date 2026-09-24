@@ -119,12 +119,15 @@ public final class SleepWorkerClient: SleepControlling {
         _ = try request(WorkerRequest(operation: .set, awake: awake))
     }
     public func stop() throws {
-        guard started, !closed else { return }
-        _ = try request(WorkerRequest(operation: .shutdown))
-        closed = true
-        try input.fileHandleForWriting.close()
+        guard started else { return }
+        if !closed {
+            _ = try request(WorkerRequest(operation: .shutdown))
+            closed = true
+            try input.fileHandleForWriting.close()
+        }
         // The worker holds the session lock until it exits, so a replacement
-        // started right after stop() must not race that exit.
+        // started right after stop() must not race that exit. A retry after a
+        // timeout (or after a disconnect) waits again instead of reporting success.
         let deadline = Date().addingTimeInterval(5)
         while process.isRunning {
             guard Date() < deadline else {

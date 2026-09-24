@@ -101,7 +101,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var displayedSymbol: String?
     private var displayedIconDescription: String?
     private var refreshPending = false
-    private var terminating = false
+    private var gate = TerminationGate()
+    private var terminating: Bool { gate.terminating }
     private var checkingUpdates = false
     private var powerSource: CFRunLoopSource?
     private var timer: Timer?
@@ -139,9 +140,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Quit waits for verified restoration. A crash instead closes the worker's
     // input pipe, which invokes the same cleanup independently of AppKit.
+    // A quit during an uninstall waits for the uninstall's outcome (see uninstallApp).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !terminating else { return .terminateLater }
-        terminating = true
+        guard gate.requestQuit() == .start else { return .terminateLater }
+        restoreSleepThenReply(sender)
+        return .terminateLater
+    }
+
+    private func restoreSleepThenReply(_ sender: NSApplication) {
         busy = true
         updateUI()
         workQueue.async {
@@ -156,14 +162,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     alert.addButton(withTitle: L("Stay Open", "Остаться"))
                     alert.addButton(withTitle: L("Quit Anyway", "Всё равно выйти"))
                     let quit = alert.runModal() == .alertSecondButtonReturn
-                    self.terminating = quit
+                    if !quit { self.gate.cancelQuit() }
                     self.busy = quit
                     sender.reply(toApplicationShouldTerminate: quit)
                     if !quit { self.updateUI() }
                 } else { sender.reply(toApplicationShouldTerminate: true) }
             }
         }
-        return .terminateLater
     }
 
     private func perform(_ work: @escaping (AppRuntime) throws -> Void,
@@ -361,7 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "LidAwake восстановит обычный сон, затем удалит:\n• свои правила сна /etc/sudoers.d/lidawake-\(getuid()) и, если оно указывает эту учётную запись, /etc/sudoers.d/lidawake (macOS запросит пароль администратора)\n• свой объект входа\n• свои настройки и ~/Library/Application Support/LidAwake\n• само приложение — оно будет перемещено в Корзину\n\nЗатем LidAwake завершит работу.")
         alert.addButton(withTitle: L("Uninstall", "Удалить"))
         alert.addButton(withTitle: L("Cancel", "Отмена"))
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard alert.runModal() == .alertFirstButtonReturn, gate.beginUninstall() else { return }
         var keptLegacyRule = false
         perform({ runtime in
             do { keptLegacyRule = try runtime.uninstallApp() } catch {
@@ -375,7 +380,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if error as? ControlError == .canceled {
                 self.showError(L("Uninstall was canceled. Nothing was removed.", "Удаление отменено. Ничего не было удалено."))
             }
-            guard error == nil else { return }
+            guard error == nil else {
+                // Sleep control was handed back to a new worker; a quit requested meanwhile runs now.
+                if self.gate.endUninstall() { self.restoreSleepThenReply(NSApp) }
+                return
+            }
             if keptLegacyRule {
                 self.showError(L("LidAwake was uninstalled. Left /etc/sudoers.d/lidawake in place because it belongs to another account or has content LidAwake does not recognize.",
                                  "LidAwake удалён. Файл /etc/sudoers.d/lidawake оставлен на месте: он принадлежит другой учётной записи или содержит то, что LidAwake не распознаёт."))
@@ -386,7 +395,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.showError(L("LidAwake was uninstalled, but the app could not be moved to the Trash. Move it to the Trash yourself.\n\n",
                                          "LidAwake удалён, но приложение не удалось переместить в Корзину. Переместите его в Корзину вручную.\n\n") + error.localizedDescription)
                     }
-                    NSApp.terminate(nil)
+                    // Sleep is already restored and the worker stopped by the uninstall.
+                    if self.gate.endUninstall() { NSApp.reply(toApplicationShouldTerminate: true) } else { NSApp.terminate(nil) }
                 }
             }
         })

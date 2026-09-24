@@ -324,4 +324,23 @@ final class SystemAdaptersTests: XCTestCase {
         XCTAssertTrue(try client.isAwake())
         try client.stop()
     }
+
+    func testStopRetriedAfterExitTimeoutWaitsForTheWorkerToExit() throws {
+        let script = directory.appendingPathComponent("slow-exit-worker")
+        let exited = directory.appendingPathComponent("exited")
+        try """
+        #!/bin/sh
+        echo '{"awake":false}'
+        read -r line
+        echo '{"awake":false}'
+        sleep 7
+        touch '\(exited.path)'
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        let client = SleepWorkerClient(executable: script)
+        try client.start()
+        XCTAssertThrowsError(try client.stop()) // Still holding the session lock after 5 s.
+        try client.stop()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: exited.path), "stop() succeeded before the worker exited")
+    }
 }
