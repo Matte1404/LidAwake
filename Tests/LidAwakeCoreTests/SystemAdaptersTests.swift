@@ -36,16 +36,57 @@ final class SystemAdaptersTests: XCTestCase {
         XCTAssertEqual(runner.calls[1].1, ["-g"])
     }
 
-    func testPMSetProbeWritesTheCurrentValueInsteadOfListingPrivileges() throws {
+    /// A runner that behaves like pmset behind sudo: `denied` values fail without changing anything.
+    private func pmsetRunner(startingAt value: String, denying denied: Set<String> = [],
+                             failingAfterApplying failing: Set<String> = []) -> (RecordingRunner, () -> String) {
         let runner = RecordingRunner()
-        for value in ["0", "1"] {
-            runner.calls = []
-            runner.respond = { args in CommandOutput(stdout: args == ["-g"] ? "SleepDisabled \(value)" : "") }
-            try PMSet(runner: runner, setup: PrivilegeSetup(runner: runner)).probeRule()
-            XCTAssertEqual(runner.calls.map { [$0.0] + $0.1 }, [
-                ["/usr/bin/pmset", "-g"],
-                ["/usr/bin/sudo", "-n", "-k", "/usr/bin/pmset", "-a", "disablesleep", value]])
+        var state = value
+        runner.respond = { args in
+            if args == ["-g"] { return CommandOutput(stdout: "SleepDisabled \(state)") }
+            let requested = args.last!
+            if denied.contains(requested) { throw ControlError.message("sudo: a password is required") }
+            state = requested
+            if failing.contains(requested) { throw ControlError.message("timed out") }
+            return CommandOutput()
         }
+        return (runner, { state })
+    }
+
+    private func sudoWrites(_ runner: RecordingRunner) -> [String] {
+        runner.calls.filter { $0.0 == "/usr/bin/sudo" }.map { $0.1.last! }
+    }
+
+    private func probe(_ runner: RecordingRunner) throws {
+        try PMSet(runner: runner, setup: PrivilegeSetup(runner: runner)).probeRule()
+    }
+
+    func testPMSetProbeProvesBothDirectionsAndLeavesSleepEnabledWhenItStartedEnabled() throws {
+        let (runner, state) = pmsetRunner(startingAt: "0")
+        try probe(runner)
+        XCTAssertEqual(sudoWrites(runner), ["0", "1", "0"])
+        XCTAssertEqual(state(), "0")
+        XCTAssertTrue(runner.calls.filter { $0.0 == "/usr/bin/sudo" }.allSatisfy { $0.1.starts(with: ["-n", "-k", "/usr/bin/pmset", "-a", "disablesleep"]) })
+    }
+
+    func testPMSetProbeNeverWritesSleepEnabledWhileSomethingHoldsItDisabled() throws {
+        let (runner, state) = pmsetRunner(startingAt: "1")
+        try probe(runner)
+        XCTAssertEqual(sudoWrites(runner), ["1"])
+        XCTAssertEqual(state(), "1")
+    }
+
+    func testPMSetProbeRejectsARuleThatAllowsOnlyOneDirectionWithoutChangingTheSetting() throws {
+        for (denied, start) in [("1", "0"), ("0", "0"), ("1", "1")] {
+            let (runner, state) = pmsetRunner(startingAt: start, denying: [denied])
+            XCTAssertThrowsError(try probe(runner), "deny \(denied) from \(start)")
+            XCTAssertEqual(state(), start)
+        }
+    }
+
+    func testPMSetProbeRestoresTheSettingWhenTheOppositeWriteFailsAfterApplying() throws {
+        let (runner, state) = pmsetRunner(startingAt: "0", failingAfterApplying: ["1"])
+        XCTAssertThrowsError(try probe(runner))
+        XCTAssertEqual(state(), "0")
     }
 
     func testPMSetRequiresTheRuleFileBeforeProbing() {

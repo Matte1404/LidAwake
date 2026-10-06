@@ -42,14 +42,30 @@ final class PMSet: PowerSettings {
     }
 
     /// `sudo -l` succeeds for any command once an admin account has any NOPASSWD rule,
-    /// so prove the rule by writing the current value, which changes nothing.
+    /// so prove the rule by running the commands. Both directions are needed: the rule must also
+    /// allow the restore. Writing the current value changes nothing; the opposite value is
+    /// written only when that is sleep-preventing (0 -> 1 -> 0), because writing 0 could put the
+    /// Mac to sleep while something else holds it awake. Starting from 0 the order also leaves
+    /// the setting unchanged when the rule is one-sided: a denied 1 changes nothing, and a
+    /// restore to 0 is only attempted after 0 was proven.
     func probeRule() throws {
-        _ = try runner.run("/usr/bin/sudo", ["-n", "-k", "/usr/bin/pmset", "-a", "disablesleep", try read() ? "1" : "0"], timeout: 10)
+        let current = try read()
+        try sudoWrite(current)
+        guard !current else { return }
+        do { try sudoWrite(true) } catch {
+            _ = try? sudoWrite(false)
+            throw error
+        }
+        try write(false)
+    }
+
+    private func sudoWrite(_ awake: Bool) throws {
+        // -k ignores cached admin authentication; recovery must work without it.
+        _ = try runner.run("/usr/bin/sudo", ["-n", "-k", "/usr/bin/pmset", "-a", "disablesleep", awake ? "1" : "0"], timeout: 10)
     }
 
     func write(_ awake: Bool) throws {
-        // -k ignores cached admin authentication; recovery must work without it.
-        _ = try runner.run("/usr/bin/sudo", ["-n", "-k", "/usr/bin/pmset", "-a", "disablesleep", awake ? "1" : "0"], timeout: 10)
+        try sudoWrite(awake)
         guard try read() == awake else {
             throw ControlError.message("macOS did not apply the sleep setting. Try Repair Sleep Setup.")
         }
