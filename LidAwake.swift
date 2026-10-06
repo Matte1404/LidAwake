@@ -275,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateMenu() {
         var entries = [MenuEntry]()
-        let controlsEnabled = pendingUserOperations == 0 && !terminating
+        let controlsEnabled = pendingUserOperations == 0 && !gate.locksMenuActions
         let awakeControlsEnabled = controlsEnabled && state.policy.isEnabled
         func item(_ id: String, _ title: String, _ action: Selector? = nil, key: String = "",
                   checked: Bool? = false, enabled: Bool = true, indent: Int = 0, symbol: String? = nil) {
@@ -382,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             guard error == nil else {
                 // Sleep control was handed back to a new worker; a quit requested meanwhile runs now.
-                if self.gate.endUninstall() { self.restoreSleepThenReply(NSApp) }
+                if self.gate.endUninstall() { self.restoreSleepThenReply(NSApp) } else { self.updateUI() }
                 return
             }
             if keptLegacyRule {

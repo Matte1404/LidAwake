@@ -31,4 +31,22 @@ final class TerminationGateTests: XCTestCase {
         gate.cancelQuit()
         XCTAssertTrue(gate.beginUninstall())
     }
+
+    func testMenuActionsStayLockedFromUninstallStartUntilItsOutcome() {
+        var gate = TerminationGate()
+        XCTAssertFalse(gate.locksMenuActions)
+        XCTAssertTrue(gate.beginUninstall())
+        XCTAssertTrue(gate.locksMenuActions)
+        XCTAssertEqual(gate.requestQuit(), .afterUninstall)
+        XCTAssertTrue(gate.locksMenuActions)
+        XCTAssertTrue(gate.endUninstall())
+        XCTAssertTrue(gate.locksMenuActions)  // quit now runs
+        gate.cancelQuit()
+        XCTAssertFalse(gate.locksMenuActions)
+
+        var plain = TerminationGate()
+        XCTAssertTrue(plain.beginUninstall())
+        XCTAssertFalse(plain.endUninstall())
+        XCTAssertFalse(plain.locksMenuActions)
+    }
 }

@@ -7,6 +7,10 @@ public struct TerminationGate {
     public private(set) var uninstalling = false
     private var quitDeferred = false
 
+    /// Menu actions stay unavailable from the start of an uninstall until its outcome
+    /// is handled (or the app is quitting).
+    public var locksMenuActions: Bool { terminating || uninstalling }
+
     public init() {}
 
     public mutating func requestQuit() -> QuitDecision {
