@@ -140,11 +140,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Quit waits for verified restoration. A crash instead closes the worker's
     // input pipe, which invokes the same cleanup independently of AppKit.
-    // A quit during an uninstall waits for the uninstall's outcome (see uninstallApp).
+    // A quit during an uninstall waits for the uninstall's outcome (see uninstallApp);
+    // the quit after a successful uninstall has nothing to restore and terminates at once.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard gate.requestQuit() == .start else { return .terminateLater }
-        restoreSleepThenReply(sender)
-        return .terminateLater
+        switch gate.requestQuit() {
+        case .terminateNow: return .terminateNow  // after a successful uninstall: nothing left to restore
+        case .start: restoreSleepThenReply(sender); return .terminateLater
+        case .alreadyTerminating, .afterUninstall: return .terminateLater
+        }
     }
 
     private func restoreSleepThenReply(_ sender: NSApplication) {
@@ -396,7 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                          "LidAwake удалён, но приложение не удалось переместить в Корзину. Переместите его в Корзину вручную.\n\n") + error.localizedDescription)
                     }
                     // Sleep is already restored and the worker stopped by the uninstall.
-                    if self.gate.endUninstall() { NSApp.reply(toApplicationShouldTerminate: true) } else { NSApp.terminate(nil) }
+                    if self.gate.endUninstall(succeeded: true) { NSApp.reply(toApplicationShouldTerminate: true) } else { NSApp.terminate(nil) }
                 }
             }
         })

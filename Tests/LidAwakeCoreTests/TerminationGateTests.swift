@@ -49,4 +49,40 @@ final class TerminationGateTests: XCTestCase {
         XCTAssertFalse(plain.endUninstall())
         XCTAssertFalse(plain.locksMenuActions)
     }
+
+    func testQuitAfterSuccessfulUninstallTerminatesWithoutRestore() {
+        var gate = TerminationGate()
+        XCTAssertTrue(gate.beginUninstall())
+        XCTAssertFalse(gate.endUninstall(succeeded: true))  // no quit was requested meanwhile
+        // The uninstall already restored sleep; a restore round-trip here would deadlock the
+        // main queue (its reply is delivered by a main-queue block the caller is still inside).
+        XCTAssertEqual(gate.requestQuit(), .terminateNow)
+        XCTAssertTrue(gate.terminating)
+        XCTAssertEqual(gate.requestQuit(), .alreadyTerminating)
+    }
+
+    func testQuitDeferredDuringSuccessfulUninstallStillRepliesAfterIt() {
+        var gate = TerminationGate()
+        XCTAssertTrue(gate.beginUninstall())
+        XCTAssertEqual(gate.requestQuit(), .afterUninstall)
+        XCTAssertTrue(gate.endUninstall(succeeded: true))
+        XCTAssertEqual(gate.requestQuit(), .alreadyTerminating)
+    }
+
+    func testQuitStillRestoresSleepUnlessAnUninstallSucceeded() {
+        var plain = TerminationGate()
+        XCTAssertEqual(plain.requestQuit(), .start)
+
+        var failed = TerminationGate()
+        XCTAssertTrue(failed.beginUninstall())
+        XCTAssertFalse(failed.endUninstall())  // failed or canceled uninstall
+        XCTAssertEqual(failed.requestQuit(), .start)
+
+        var failedThenStayOpen = TerminationGate()
+        XCTAssertTrue(failedThenStayOpen.beginUninstall())
+        XCTAssertFalse(failedThenStayOpen.endUninstall())
+        XCTAssertTrue(failedThenStayOpen.beginUninstall())
+        XCTAssertFalse(failedThenStayOpen.endUninstall())
+        XCTAssertEqual(failedThenStayOpen.requestQuit(), .start)
+    }
 }
