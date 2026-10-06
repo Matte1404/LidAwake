@@ -77,8 +77,9 @@ protocol RecoveryJournal {
     func save(_ pending: Bool) throws
 }
 
-/// Sole writer for a running app. Its journal is committed before enabling sleep
-/// prevention, so even a crash during the command leaves a recoverable obligation.
+/// Sole writer for a running app. Its journal is committed before any write that can leave
+/// sleep disabled (the permission probe and the enable), so even a crash during the
+/// command leaves a recoverable obligation.
 final class SleepSession: SleepControlling {
     private let settings: PowerSettings
     private let journal: RecoveryJournal
@@ -107,8 +108,12 @@ final class SleepSession: SleepControlling {
         if awake {
             // Check both directions before accepting ownership, even if already awake.
             if !ownsOverride {
-                try settings.requireAutomaticControl()
+                // The probe can leave sleep disabled (0 -> 1 -> 0), so commit the journal first.
                 try journal.save(true)
+                do { try settings.requireAutomaticControl() } catch {
+                    releaseClaim(startedAwake: current)
+                    throw error
+                }
                 ownsOverride = true
             }
             if !current { try settings.write(true) }
@@ -117,6 +122,13 @@ final class SleepSession: SleepControlling {
             if ownsOverride { try journal.save(false) }
             ownsOverride = false
         }
+    }
+
+    /// A rejected probe hands the claim back. Keep it only if the probe left sleep disabled
+    /// from a 0 start (or that cannot be told), because restoring that is now owed.
+    private func releaseClaim(startedAwake: Bool) {
+        if !startedAwake, (try? settings.read()) != false { ownsOverride = true; return }
+        if (try? journal.save(false)) == nil { ownsOverride = true }
     }
 
     func stop() throws {

@@ -89,6 +89,52 @@ final class SystemAdaptersTests: XCTestCase {
         XCTAssertEqual(state(), "0")
     }
 
+    /// PMSet with the setup-file check skipped, so a SleepSession can drive the real probe.
+    private final class ProbingPower: PowerSettings {
+        let pmset: PMSet
+        init(_ runner: RecordingRunner) { pmset = PMSet(runner: runner, setup: PrivilegeSetup(runner: runner)) }
+        func read() throws -> Bool { try pmset.read() }
+        func requireAutomaticControl() throws { try pmset.probeRule() }
+        func write(_ awake: Bool) throws { try pmset.write(awake) }
+    }
+
+    func testProbeWritesThatCanLeaveSleepDisabledAreCoveredByTheRecoveryJournal() throws {
+        let (runner, state) = pmsetRunner(startingAt: "0")
+        let journal = MemoryJournal()
+        var journalWhenSleepWasDisabled: Bool?
+        var killed = false, survives = false
+        let applied = runner.respond
+        runner.respond = { args in
+            if args == ["-g"] { return try applied(args) }
+            if args.last == "1" { journalWhenSleepWasDisabled = journal.pending }
+            // Simulated process death right after the 1 was applied: nothing else runs.
+            if !survives && (killed || (args.last == "0" && state() == "1")) { killed = true; throw ControlError.message("killed") }
+            return try applied(args)
+        }
+        let session = try SleepSession(settings: ProbingPower(runner), journal: journal)
+        XCTAssertThrowsError(try session.setAwake(true))
+        XCTAssertEqual(state(), "1")
+        XCTAssertEqual(journalWhenSleepWasDisabled, true, "journal must be committed before the probe disables sleep")
+        XCTAssertTrue(journal.pending, "sleep is left disabled, so recovery must still be owed")
+        // A relaunch (or the worker's stop) restores it from the journal.
+        survives = true
+        let relaunched = try SleepSession(settings: ProbingPower(runner), journal: journal)
+        try relaunched.recover()
+        XCTAssertEqual(state(), "0")
+        XCTAssertFalse(journal.pending)
+    }
+
+    func testRejectedProbeReleasesTheClaimItTookBeforeProbing() throws {
+        for (denied, start) in [("1", "0"), ("0", "0"), ("1", "1")] {
+            let (runner, state) = pmsetRunner(startingAt: start, denying: [denied])
+            let journal = MemoryJournal()
+            let session = try SleepSession(settings: ProbingPower(runner), journal: journal)
+            XCTAssertThrowsError(try session.setAwake(true), "deny \(denied) from \(start)")
+            XCTAssertEqual(state(), start)
+            XCTAssertFalse(journal.pending, "nothing was changed, so nothing is owed")
+        }
+    }
+
     func testPMSetRequiresTheRuleFileBeforeProbing() {
         let runner = RecordingRunner()
         let pmset = PMSet(runner: runner, setup: PrivilegeSetup(runner: runner, uid: 502, directory: directory.path))

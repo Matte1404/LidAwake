@@ -7,7 +7,16 @@ final class FilePower: PowerSettings {
     let path: URL
     init(directory: URL) { path = directory.appendingPathComponent("awake") }
     func read() throws -> Bool { try String(contentsOf: path, encoding: .utf8) == "1" }
-    func requireAutomaticControl() throws {}
+    func requireAutomaticControl() throws {
+        // crash-during-probe: like the real 0 -> 1 -> 0 probe, whose 1 must already be journaled.
+        guard ProcessInfo.processInfo.environment["LIDAWAKE_RECOVERY_PROBE"] != nil else { return }
+        let marker = path.deletingLastPathComponent().appendingPathComponent("restore-sleep")
+        guard let size = try? FileManager.default.attributesOfItem(atPath: marker.path)[.size] as? Int, size > 0 else {
+            throw ControlError.message("Probe disabled sleep before the recovery journal was committed.")
+        }
+        try write(true)
+        try write(false)
+    }
     func write(_ awake: Bool) throws {
         try (awake ? "1" : "0").write(to: path, atomically: true, encoding: .utf8)
         if awake { Thread.sleep(forTimeInterval: 0.4) }
@@ -31,7 +40,7 @@ if mode == "--sleep-worker" {
 }
 let client = SleepWorkerClient(executable: URL(fileURLWithPath: CommandLine.arguments[0]))
 try client.start()
-if mode == "crash-during-write" {
+if mode == "crash-during-write" || mode == "crash-during-probe" {
     DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) { kill(getpid(), SIGKILL) }
 }
 try client.setAwake(true)

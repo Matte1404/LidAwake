@@ -13,5 +13,4 @@ One line per item, context in the linked file. Product ideas live in `TODO.md`.
 
 ## Unprioritized
 - **[conf:0.5] Sources/LidAwakeCore/SleepControl.swift:47** — when SleepDisabled is already 1 and not owned, `probeRule()` proves only `disablesleep 1`; a rule denying `0` still passes → docs/todos/probe-one-sided-rule-when-already-awake.md
-- **[conf:0.35] Sources/LidAwakeCore/SleepControl.swift:47** — `probeRule()` writes the value back before `SleepSession` commits its journal (narrow external-writer race) → docs/reviews/lidawake-fixes/round1.md
 - **lidawake-fixes review close-out** — 2 theoretical leftovers (uninstall abort variant, login-item rollback) → docs/todos/lidawake-fixes-close-out.md
